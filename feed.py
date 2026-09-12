@@ -177,11 +177,17 @@ def summary(items, coverage):
 
 
 def publish(db, changes, catalog, coverage):
+    if getattr(db, 'lease', None):
+        lease = db.query("UPDATE feed_lock SET expires_at=datetime('now','+45 minutes') WHERE id=1 AND owner=? AND expires_at>datetime('now') RETURNING owner", (db.lease,))
+        if not lease:
+            raise RuntimeError('writer_lease_lost')
     changes = {key: item for key, item in changes.items() if canonical(item) != canonical(catalog.get(key))}
     # Reserve conservatively for table/index writes plus publication metadata.
     cost = 8 * len(changes) + 20
+    if cost > 60000:
+        raise RuntimeError('daily_write_budget')
     budget = db.query('INSERT INTO feed_write_budget(day,used) VALUES(?,?) ON CONFLICT(day) DO UPDATE SET used=used+excluded.used WHERE used+excluded.used<=60000 RETURNING used', (now()[:10], cost))
-    if cost > 60000 or not budget:
+    if not budget:
         raise RuntimeError('daily_write_budget')
     generation = time.time_ns() // 1000
     for start in range(0, len(changes), 10):
@@ -222,6 +228,12 @@ def sync_kev(db, request=fetch):
     if not isinstance(document, dict) or not isinstance(document.get('vulnerabilities'), list) or len(document['vulnerabilities']) < 1:
         raise ValueError('invalid_kev_catalog')
     catalog = read_catalog(db); changes = {}
+    declared_count = document.get('count')
+    if declared_count is not None and declared_count != len(document['vulnerabilities']):
+        raise ValueError('truncated_kev_catalog')
+    previous_count = sum(item['known_exploited'] for item in catalog.values())
+    if previous_count > 10 and len(document['vulnerabilities']) < previous_count * 0.9:
+        raise ValueError('unexpected_kev_catalog_shrink')
     for raw in document['vulnerabilities']:
         item = parse_kev(raw, catalog.get(raw.get('cveID'))); changes[item['cve_id']] = item
     for key, item in catalog.items():
@@ -285,6 +297,11 @@ def run(db, source):
     except (RuntimeError, ValueError) as error:
         # Error messages are fixed codes; never persist a request body or token.
         code = str(error) if re.fullmatch('[a-z0-9_]+', str(error)) else 'sync_failed'
+        if code == 'daily_write_budget':
+            db.query("UPDATE feed_runs SET status='budget_paused',finished_at=?,detail=? WHERE id=?", (now(), code, run_id))
+            db.query("UPDATE feed_state SET status='budget_paused',last_attempt_at=? WHERE source=?", (now(), source))
+            print(canonical({'source': source, 'status': 'budget_paused', 'detail': 'Resume after UTC midnight; published data and cursor retained.'}))
+            return True
         db.query('UPDATE feed_runs SET status=?,finished_at=?,detail=? WHERE id=?', ('failed', now(), code, run_id))
         db.query("INSERT INTO feed_state(source,last_attempt_at,status) VALUES(?,?,'failed') ON CONFLICT(source) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,status='failed'", (source, now()))
         print(canonical({'source': source, 'status': 'failed', 'detail': code}))
@@ -294,10 +311,36 @@ def run(db, source):
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument('--sqlite'); parser.add_argument('--source', choices=['cisa-kev', 'nvd', 'all'], default='all')
     args = parser.parse_args(); db = SQLite(args.sqlite) if args.sqlite else D1()
-    results = [run(db, source) for source in (['cisa-kev', 'nvd'] if args.source == 'all' else [args.source])]
+    import uuid
+    db.lease = str(uuid.uuid4())
+    lock = db.query("INSERT INTO feed_lock(id,owner,expires_at) VALUES(1,?,datetime('now','+45 minutes')) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE expires_at<=datetime('now') RETURNING owner", (db.lease,))
+    if not lock:
+        raise SystemExit('A public feed writer is already active; no data was changed.')
+    try:
+        results = [run(db, source) for source in (['cisa-kev', 'nvd'] if args.source == 'all' else [args.source])]
+        prune(db)
+    finally:
+        db.query('DELETE FROM feed_lock WHERE id=1 AND owner=?', (db.lease,))
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).date().isoformat()
     db.query('DELETE FROM ai_reservations WHERE day<?', (cutoff,)); db.query('DELETE FROM ai_quota WHERE day<?', (cutoff,))
     raise SystemExit(0 if all(results) else 1)
+
+
+def prune(db):
+    budget = db.query('INSERT INTO feed_write_budget(day,used) VALUES(?,2200) ON CONFLICT(day) DO UPDATE SET used=used+2200 WHERE used+2200<=60000 RETURNING used', (now()[:10],))
+    if not budget:
+        return
+    # Keep the current and previous published version of every CVE for rollback.
+    db.query('''DELETE FROM intel_records WHERE (cve_id,generation) IN (
+      SELECT r.cve_id,r.generation FROM intel_records r,public_state s WHERE s.id=1
+      AND r.generation<s.previous_generation AND EXISTS (
+        SELECT 1 FROM intel_records n JOIN published_generations p ON p.generation=n.generation
+        WHERE n.cve_id=r.cve_id AND n.generation>r.generation AND n.generation<=s.previous_generation)
+      LIMIT 200)''')
+    db.query('''DELETE FROM public_summaries WHERE generation IN (
+      SELECT generation FROM public_summaries,public_state WHERE id=1
+      AND generation NOT IN(active_generation,previous_generation) LIMIT 200)''')
+    db.query("DELETE FROM feed_runs WHERE id IN (SELECT id FROM feed_runs WHERE started_at<datetime('now','-30 days') LIMIT 100)")
 
 
 if __name__ == '__main__':

@@ -93,3 +93,6 @@ CREATE TRIGGER IF NOT EXISTS reserve_ai BEFORE INSERT ON ai_reservations BEGIN
     ON CONFLICT(day,subject) DO UPDATE SET calls=calls+1;
 END;
 CREATE INDEX IF NOT EXISTS ai_reservation_window ON ai_reservations(day,minute);
+CREATE TABLE IF NOT EXISTS feed_lock (
+  id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL
+);

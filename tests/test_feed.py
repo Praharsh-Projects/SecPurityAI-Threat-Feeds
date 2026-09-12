@@ -1,6 +1,9 @@
 import datetime as dt
 import json
 import tempfile
+import sqlite3
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -105,6 +108,52 @@ class FeedTests(unittest.TestCase):
             self.db.query('INSERT INTO ai_reservations(id,day,visitor,address,minute) VALUES(?,?,?,?,?)', ('blocked', '2026-09-12', 'visitor:last', 'ip:last', '101'))
         self.db.db.rollback()
         self.assertEqual(self.db.query("SELECT neurons FROM ai_quota WHERE subject='global'")[0]['neurons'], 8000)
+
+    def test_parallel_reservations_cannot_exceed_global_cap(self):
+        path = str(Path(self.tmp.name) / 'test.db')
+        def reserve(n):
+            connection = sqlite3.connect(path, timeout=20)
+            try:
+                connection.execute('INSERT INTO ai_reservations(id,day,visitor,address,minute) VALUES(?,?,?,?,?)', (str(n), '2026-09-12', f'visitor:{n}', f'ip:{n}', str(n)))
+                connection.commit(); return True
+            except sqlite3.IntegrityError:
+                connection.rollback(); return False
+            finally:
+                connection.close()
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            self.assertEqual(sum(pool.map(reserve, range(150))), 100)
+        quota = self.db.query("SELECT calls,neurons FROM ai_quota WHERE subject='global'")[0]
+        self.assertEqual(quota, {'calls': 100, 'neurons': 8000})
+
+    def test_pruning_preserves_current_and_previous(self):
+        catalog = {}
+        for n in range(4):
+            item = {**feed.parse_kev(kev()), 'description': f'version {n}'}
+            feed.publish(self.db, {item['cve_id']: item}, catalog, f'gen {n}')
+        feed.prune(self.db)
+        self.assertEqual(feed.read_catalog(self.db)['CVE-2026-1234']['description'], 'version 3')
+        self.assertEqual(self.db.query('SELECT COUNT(*) AS n FROM intel_records')[0]['n'], 2)
+        self.assertEqual(self.db.query('SELECT COUNT(*) AS n FROM public_summaries')[0]['n'], 2)
+
+    def test_partial_kev_catalog_does_not_replace_good_data(self):
+        self.test_publication(); before = feed.read_catalog(self.db)
+        with self.assertRaisesRegex(ValueError, 'truncated_kev_catalog'):
+            feed.sync_kev(self.db, lambda *_: (200, {'count': 2, 'vulnerabilities': [kev()]}, {}))
+        self.assertEqual(before, feed.read_catalog(self.db))
+
+    def test_429_backoff_is_bounded_and_does_not_publish(self):
+        sleeps = []
+        with patch('urllib.request.urlopen', side_effect=urllib.error.HTTPError('https://example.test', 429, '', {'Retry-After': '999'}, None)):
+            with self.assertRaisesRegex(RuntimeError, 'upstream_retries_exhausted'):
+                feed.fetch('https://example.test', sleeper=sleeps.append)
+        self.assertEqual(sleeps, [120, 120, 120, 120])
+
+    def test_budget_pause_is_not_reported_as_upstream_outage(self):
+        feed.save_cursor(self.db, 'nvd', {'window': {'pubStartDate': '2026-01-01'}, 'index': 250})
+        with patch('feed.sync_nvd', side_effect=RuntimeError('daily_write_budget')):
+            self.assertTrue(feed.run(self.db, 'nvd'))
+        self.assertEqual(feed.cursor_for(self.db, 'nvd')['index'], 250)
+        self.assertEqual(self.db.query("SELECT status FROM feed_state WHERE source='nvd'")[0]['status'], 'budget_paused')
 
 
 if __name__ == '__main__': unittest.main()

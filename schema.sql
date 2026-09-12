@@ -96,3 +96,5 @@ CREATE INDEX IF NOT EXISTS ai_reservation_window ON ai_reservations(day,minute);
 CREATE TABLE IF NOT EXISTS feed_lock (
   id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS intel_product ON intel_records(lower(json_extract(payload,'$.product')),cve_id);

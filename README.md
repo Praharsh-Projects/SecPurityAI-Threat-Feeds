@@ -45,3 +45,10 @@ This product uses the NVD API but is not endorsed or certified by the NVD.
 Retain source attribution. CVSS is severity, not exploitation probability or
 proof of device exposure. CISA deadlines are not universal patch deadlines.
 No original upstream licensing or attribution rights are changed by this repo.
+
+The writer lease prevents overlapping manual/workflow imports. A successful job
+may report `budget_paused`: this means the conservative daily allocation stopped
+further writes, not that NVD was fully imported. The saved cursor resumes after
+UTC midnight. Expired leases recover after 45 minutes if a job is terminated.
+Superseded CVE versions are pruned in bounded batches while preserving the current
+and previous publication for rollback. Product/CVE/vendor search uses indexes.

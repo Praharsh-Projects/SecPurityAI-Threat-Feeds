@@ -1,6 +1,16 @@
 name: Refresh public intelligence
 on:
   workflow_dispatch:
+    inputs:
+      dispatch_kind:
+        description: Dispatch provenance for owner verification
+        type: choice
+        options: [manual, cloudflare-cron]
+        default: manual
+      scheduled_at:
+        description: Cloudflare scheduler UTC timestamp, empty for manual runs
+        type: string
+        required: false
 permissions:
   contents: read
 concurrency:
@@ -26,3 +36,5 @@ jobs:
           PUBLIC_D1_DATABASE_ID: ${{ secrets.PUBLIC_D1_DATABASE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          FEED_DISPATCH_KIND: ${{ inputs.dispatch_kind }}
+          FEED_SCHEDULED_AT: ${{ inputs.scheduled_at }}

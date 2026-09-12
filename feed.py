@@ -295,7 +295,10 @@ def sync_nvd(db, request=fetch, sleeper=time.sleep, max_pages=30):
 
 def run(db, source):
     run_id = time.time_ns() // 1000
-    db.query('INSERT INTO feed_runs(id,source,status,started_at) VALUES(?,?,?,?)', (run_id, source, 'running', now()))
+    origin = 'cloudflare-cron' if os.environ.get('FEED_DISPATCH_KIND') == 'cloudflare-cron' else 'manual'
+    provenance = {'origin': origin, 'scheduled_at': os.environ.get('FEED_SCHEDULED_AT', '')[:40],
+                  'github_run_id': re.sub('[^0-9]', '', os.environ.get('GITHUB_RUN_ID', ''))[:30]}
+    db.query('INSERT INTO feed_runs(id,source,status,started_at,detail) VALUES(?,?,?,?,?)', (run_id, source, 'running', now(), canonical(provenance)))
     try:
         count = sync_kev(db) if source == 'cisa-kev' else sync_nvd(db)
         cursor = cursor_for(db, source)

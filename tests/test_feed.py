@@ -87,6 +87,17 @@ class FeedTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'daily_write_budget'): feed.publish(self.db, {}, {}, 'full')
         self.assertEqual(feed.read_catalog(self.db), {})
 
+    def test_kev_refresh_keeps_partial_nvd_coverage_visible(self):
+        feed.save_cursor(self.db, 'nvd', {'window': {'pubStartDate': '2026-06-01'}, 'index': 250, 'total': 1000})
+        feed.sync_kev(self.db, lambda *_: (200, {'vulnerabilities': [kev()]}, {}))
+        self.assertIn('250 of 1000', self.db.query('SELECT coverage FROM public_state')[0]['coverage'])
+
+    def test_wrong_nvd_page_does_not_advance_cursor(self):
+        with self.assertRaisesRegex(ValueError, 'unexpected_nvd_page'):
+            feed.sync_nvd(self.db, lambda *_: (200, {'startIndex': 250, 'totalResults': 500, 'vulnerabilities': [nvd()]}, {}))
+        self.assertEqual(feed.cursor_for(self.db, 'nvd'), {})
+        self.assertEqual(feed.read_catalog(self.db), {})
+
     def test_source_outage_preserves_good_records(self):
         self.test_publication(); before = feed.read_catalog(self.db)
         with patch('feed.sync_kev', side_effect=RuntimeError('upstream_retries_exhausted')):

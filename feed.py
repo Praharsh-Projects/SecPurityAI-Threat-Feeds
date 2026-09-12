@@ -239,7 +239,14 @@ def sync_kev(db, request=fetch):
     for key, item in catalog.items():
         if item['known_exploited'] and key not in changes:
             changes[key] = {**item, 'known_exploited': False, 'kev_added_at': None, 'due_date': None, 'required_action': None, 'ransomware': 'Unknown'}
-    count = publish(db, changes, catalog, 'Full KEV catalog; NVD coverage follows completed/resumable ingestion windows.')
+    nvd_cursor = cursor_for(db, 'nvd')
+    if nvd_cursor.get('window'):
+        coverage = f"Full KEV; NVD bootstrap/catch-up: {nvd_cursor.get('index', 0)} of {nvd_cursor.get('total', 'unknown')} source records imported in the active window."
+    elif nvd_cursor.get('last_completed'):
+        coverage = f"Full KEV; NVD ingestion completed through {nvd_cursor['last_completed']}."
+    else:
+        coverage = 'Full KEV catalog; NVD 120-day bootstrap not yet completed.'
+    count = publish(db, changes, catalog, coverage)
     save_cursor(db, 'cisa-kev', {'etag': response_headers.get('ETag') or response_headers.get('etag'), 'last_modified': response_headers.get('Last-Modified') or response_headers.get('last-modified'), 'catalog_version': document.get('catalogVersion')}, True)
     return count
 
@@ -268,6 +275,8 @@ def sync_nvd(db, request=fetch, sleeper=time.sleep, max_pages=30):
         raw = document['vulnerabilities']; total = document.get('totalResults')
         if not isinstance(total, int) or total < 0 or (not raw and index < total):
             raise ValueError('truncated_nvd_page')
+        if len(raw) > 250 or document.get('startIndex', index) != index:
+            raise ValueError('unexpected_nvd_page')
         changes = {}
         for row in raw:
             cve = row.get('cve', {}).get('id'); item = parse_nvd(row, changes.get(cve) or catalog.get(cve)); changes[item['cve_id']] = item
